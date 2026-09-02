@@ -477,7 +477,10 @@ int main() {
         assert(manager.get_facing(gap_viewport, 2, 3) == native_sprite_facing);
     }
 
-    constexpr uint32_t animation_duration_ms = 100;
+    constexpr uint32_t animation_duration_ms = default_movement_duration_ms;
+    assert(animation_progress(animation_duration_ms / 4, 0, animation_duration_ms) == 0.25f);
+    assert(animation_progress(3 * animation_duration_ms / 4, 0, animation_duration_ms) ==
+           0.75f);
     assert(animation_progress(animation_duration_ms, 0, animation_duration_ms) == 1.0f);
     assert(inherited_visual_source_tile(0, 0, 1) == -1);
     assert(inherited_visual_source_tile(2, 0, 1) == 1);
@@ -489,6 +492,43 @@ int main() {
            visual_layer_descriptor(viewport_visual_layer::up).anchor_offset.y == 1);
     assert(visual_layer_descriptor(viewport_visual_layer::upleft).anchor_offset.x == 1 &&
            visual_layer_descriptor(viewport_visual_layer::upleft).anchor_offset.y == 1);
+
+    // Cadence survives a completed animation, so slow game FPS does not leave a
+    // stationary gap before the next tile transition.
+    {
+        constexpr int32_t dim = 4;
+        constexpr int32_t creature_texpos = 42;
+        constexpr uint32_t initial_frame_ms = 1000;
+        constexpr uint32_t first_step_interval_ms = 16;
+        constexpr uint32_t cadence_interval_ms = 116;
+        constexpr uint32_t expiry_frame_ms =
+            initial_frame_ms + first_step_interval_ms + default_movement_duration_ms + 1;
+        using cadence_grid = test_grid<dim>;
+        cadence_grid empty;
+        cadence_grid first;
+        cadence_grid second;
+        cadence_grid third;
+        const int viewport_token = 0;
+        const void *viewport = &viewport_token;
+        first.at(2, 1) = creature_texpos;
+        second.at(1, 1) = creature_texpos;
+        third.at(0, 1) = creature_texpos;
+
+        visual_animation_managerst manager;
+        auto input = make_input(viewport, empty);
+        set_layer(input, viewport_visual_layer::center, first, empty);
+        run_frame(manager, input, initial_frame_ms);
+        set_layer(input, viewport_visual_layer::center, second, first);
+        run_frame(manager, input, initial_frame_ms + first_step_interval_ms);
+        run_frame(manager, input, expiry_frame_ms); // first animation has expired
+        set_layer(input, viewport_visual_layer::center, third, second);
+        run_frame(manager, input, initial_frame_ms + first_step_interval_ms + cadence_interval_ms);
+        run_frame(manager, input,
+                  initial_frame_ms + first_step_interval_ms + 3 * cadence_interval_ms / 2);
+        constexpr float half_progress = 0.5f;
+        assert(manager.get_movement(viewport, viewport_visual_layer::center, 0, 1).progress ==
+               half_progress);
+    }
 
     using small_grid = test_grid<3>;
     constexpr int32_t creature_texpos = 42;

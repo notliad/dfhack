@@ -25,6 +25,7 @@
 #include "df/global_objects.h"
 #include "df/graphic.h"
 #include "df/graphic_viewportst.h"
+#include "df/init.h"
 #include "df/renderer_2d_base.h"
 #include "df/texture_fullid.h"
 #include "df/viewport_spatter_flag.h"
@@ -37,6 +38,7 @@ DFHACK_PLUGIN("smooth-movement");
 DFHACK_PLUGIN_IS_ENABLED(is_enabled);
 
 REQUIRE_GLOBAL(gps);
+REQUIRE_GLOBAL(init);
 REQUIRE_GLOBAL(window_x);
 REQUIRE_GLOBAL(window_y);
 REQUIRE_GLOBAL(window_z);
@@ -176,6 +178,13 @@ template <typename Viewport> auto visual_layers(Viewport *vp, bool previous = fa
     return layers;
 }
 
+uint32_t fallback_movement_duration_ms() {
+    const int32_t gfps_cap = init ? init->gfps_cap : default_game_fps;
+    if (gfps_cap <= 0)
+        return default_movement_duration_ms;
+    return std::max(1U, (default_movement_duration_numerator + gfps_cap / 2) / gfps_cap);
+}
+
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp) {
     const df::graphic_viewportst *const_viewport = vp;
     return {vp,
@@ -183,6 +192,7 @@ viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp) {
             visual_context_revision,
             visual_layers(const_viewport),
             visual_layers(const_viewport, true),
+            fallback_movement_duration_ms(),
             df::coord2d(window_x ? *window_x : 0, window_y ? *window_y : 0)};
 }
 

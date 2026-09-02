@@ -133,12 +133,18 @@ inline bool visual_layer_matches(viewport_visual_layer layer, int32_t current, i
                                                                : previous == current;
 }
 
+constexpr uint32_t default_movement_duration_ms = 100;
+constexpr int32_t default_game_fps = 100;
+constexpr uint32_t default_movement_duration_numerator =
+    default_movement_duration_ms * uint32_t(default_game_fps);
+
 struct viewport_visual_animation_inputst {
     const df::graphic_viewportst *viewport = nullptr;
     df::coord2d dimensions = df::coord2d(0, 0);
     uint64_t context_revision = 0;
     std::array<const int32_t *, static_cast<size_t>(viewport_visual_layer::count)> current{};
     std::array<const int32_t *, static_cast<size_t>(viewport_visual_layer::count)> previous{};
+    uint32_t movement_duration_ms = default_movement_duration_ms;
     // Current map-scroll offset (window_x/window_y). A pure pan does not bump
     // context_revision. Only a hint: it changes at input time, the buffers shift
     // on a later render frame.
@@ -163,8 +169,7 @@ struct visual_movement_renderst {
 };
 
 inline float animation_progress(uint32_t now_ms, uint32_t start_time_ms, uint32_t duration_ms) {
-    const float linear = std::min(1.0f, float(now_ms - start_time_ms) / duration_ms);
-    return linear * linear * (3.0f - 2.0f * linear);
+    return std::min(1.0f, float(now_ms - start_time_ms) / duration_ms);
 }
 
 inline bool visual_moved_between_tiles(viewport_visual_layer layer, const int32_t *current,
@@ -206,6 +211,14 @@ class visual_animation_managerst {
         DFHack::Coord2d<float> source;
         df::coord2d target;
         uint32_t start_time_ms;
+        uint32_t duration_ms;
+    };
+
+    struct movement_cadencest {
+        viewport_visual_layer layer;
+        int32_t texpos;
+        df::coord2d tile;
+        uint32_t last_move_time_ms;
     };
 
     struct viewport_animationst {
@@ -215,6 +228,8 @@ class visual_animation_managerst {
         bool has_context = false;
         bool seen = false;
         std::vector<movementst> movements;
+        std::vector<movement_cadencest> movement_cadences;
+        uint32_t movement_duration_ms = default_movement_duration_ms;
         // One facing per tile, not per unit: the viewport exposes one creature
         // texpos per tile.
         std::vector<int8_t> facing;
@@ -247,8 +262,8 @@ class visual_animation_managerst {
     bool force_full_redraw = false;
     std::vector<viewport_animationst> viewports;
 
-    // Tuned visual transition length; this is not a DF timing contract.
-    static constexpr uint32_t movement_duration_ms = 100;
+    // Cadence is trusted for only a bounded multiple of the configured fallback.
+    static constexpr uint32_t max_movement_cadence_baselines = 4;
     // Scrolling faster than detection keeps up: give up rather than test ever
     // more prefixes.
     static constexpr size_t max_pending_shifts = 8;
@@ -270,6 +285,7 @@ class visual_animation_managerst {
 
     static void abandon_pending(viewport_animationst &state) {
         state.movements.clear();
+        state.movement_cadences.clear();
         clear_pending(state);
     }
 
@@ -388,8 +404,13 @@ class visual_animation_managerst {
         return viewports.back();
     }
 
-    float movement_progress(uint32_t start_time_ms) const {
-        return animation_progress(frame_time_ms, start_time_ms, movement_duration_ms);
+    float movement_progress(uint32_t start_time_ms, uint32_t duration_ms) const {
+        return animation_progress(frame_time_ms, start_time_ms, duration_ms);
+    }
+
+    static bool valid_movement_cadence(uint32_t interval_ms, uint32_t baseline_ms) {
+        return interval_ms != 0 &&
+               uint64_t(interval_ms) <= uint64_t(baseline_ms) * max_movement_cadence_baselines;
     }
 
   public:
@@ -447,6 +468,10 @@ class visual_animation_managerst {
         state.has_context = true;
         state.pan = input.pan;
         state.has_pan = true;
+        if (state.movement_duration_ms != input.movement_duration_ms) {
+            state.movement_cadences.clear();
+            state.movement_duration_ms = input.movement_duration_ms;
+        }
         if (context_changed) {
             state.facing.assign(size_t(input.dimensions.x) * size_t(input.dimensions.y),
                                 int8_t(native_sprite_facing));
@@ -534,6 +559,16 @@ class visual_animation_managerst {
                                               movement.target.y >= input.dimensions.y;
                                    }),
                     state.movements.end());
+                state.movement_cadences.erase(
+                    std::remove_if(state.movement_cadences.begin(), state.movement_cadences.end(),
+                                   [&](movement_cadencest &cadence) {
+                                       cadence.tile = cadence.tile - df::coord2d(dwx, dwy);
+                                       return cadence.tile.x < 0 ||
+                                              cadence.tile.x >= input.dimensions.x ||
+                                              cadence.tile.y < 0 ||
+                                              cadence.tile.y >= input.dimensions.y;
+                                   }),
+                    state.movement_cadences.end());
                 // Facing describes creatures still on screen, so translate it rather
                 // than drop it.
                 if (state.facing.size() ==
@@ -614,6 +649,10 @@ class visual_animation_managerst {
             const int32_t tile_count = input.dimensions.x * input.dimensions.y;
             std::vector<uint8_t> claimed_sources(tile_count);
             const size_t existing_movement_count = state.movements.size();
+            const std::vector<movement_cadencest> cadences_at_frame_start =
+                state.movement_cadences;
+            std::vector<uint8_t> claimed_cadences(cadences_at_frame_start.size());
+            std::vector<movement_cadencest> new_cadences;
             // A chained movement's source may already have been rewritten this frame.
             const std::vector<int8_t> facing_at_frame_start = state.facing;
             // Source clears are deferred until every movement this frame is
@@ -693,13 +732,38 @@ class visual_animation_managerst {
                         claimed_sources[source] = 1;
                         DFHack::Coord2d<float> visual_source{
                             float(source / input.dimensions.y), float(source % input.dimensions.y)};
+                        uint32_t duration_ms = state.movement_duration_ms;
+                        size_t cadence_source = 0;
+                        int32_t cadence_count = 0;
+                        const df::coord2d source_tile(source / input.dimensions.y,
+                                                      source % input.dimensions.y);
+                        for (size_t i = 0; i < cadences_at_frame_start.size(); ++i) {
+                            const movement_cadencest &cadence = cadences_at_frame_start[i];
+                            if (claimed_cadences[i] || cadence.layer !=
+                                                          static_cast<viewport_visual_layer>(layer) ||
+                                cadence.tile != source_tile || previous[source] == 0 ||
+                                !visual_layer_matches(cadence.layer, previous[source], cadence.texpos))
+                                continue;
+                            cadence_source = i;
+                            ++cadence_count;
+                        }
+                        if (cadence_count == 1) {
+                            claimed_cadences[cadence_source] = 1;
+                            const uint32_t interval_ms =
+                                frame_time_ms - cadences_at_frame_start[cadence_source].last_move_time_ms;
+                            if (valid_movement_cadence(interval_ms, state.movement_duration_ms))
+                                duration_ms = interval_ms;
+                        }
+                        new_cadences.push_back({static_cast<viewport_visual_layer>(layer), texpos,
+                                                df::coord2d(x, y), frame_time_ms});
                         for (size_t i = 0; i < existing_movement_count; ++i) {
                             const movementst &movement = state.movements[i];
                             if (movement.layer != static_cast<viewport_visual_layer>(layer) ||
                                 movement.target.x != visual_source.x ||
                                 movement.target.y != visual_source.y)
                                 continue;
-                            const float progress = movement_progress(movement.start_time_ms);
+                            const float progress =
+                                movement_progress(movement.start_time_ms, movement.duration_ms);
                             visual_source = movement.source.lerp(
                                 {float(movement.target.x), float(movement.target.y)}, progress);
                             break;
@@ -708,7 +772,8 @@ class visual_animation_managerst {
                                                    texpos,
                                                    visual_source,
                                                    df::coord2d(x, y),
-                                                   frame_time_ms});
+                                                   frame_time_ms,
+                                                   duration_ms});
                         if (static_cast<viewport_visual_layer>(layer) ==
                                 viewport_visual_layer::center &&
                             state.facing.size() ==
@@ -734,6 +799,32 @@ class visual_animation_managerst {
                         state.facing[size_t(pending_source)] = int8_t(native_sprite_facing);
                 }
             }
+            std::vector<movement_cadencest> retained_cadences;
+            retained_cadences.reserve(cadences_at_frame_start.size() + new_cadences.size());
+            for (size_t i = 0; i < cadences_at_frame_start.size(); ++i) {
+                if (claimed_cadences[i])
+                    continue;
+                const movement_cadencest &cadence = cadences_at_frame_start[i];
+                const size_t layer = static_cast<size_t>(cadence.layer);
+                const int32_t tile = cadence.tile.x * input.dimensions.y + cadence.tile.y;
+                if (!valid_movement_cadence(frame_time_ms - cadence.last_move_time_ms,
+                                            state.movement_duration_ms) ||
+                    input.current[layer][tile] == 0 ||
+                    !visual_layer_matches(cadence.layer, input.current[layer][tile], cadence.texpos))
+                    continue;
+                retained_cadences.push_back(cadence);
+            }
+            for (const movement_cadencest &cadence : new_cadences) {
+                retained_cadences.erase(
+                    std::remove_if(retained_cadences.begin(), retained_cadences.end(),
+                                   [&](const movement_cadencest &existing) {
+                                       return existing.layer == cadence.layer &&
+                                              existing.tile == cadence.tile;
+                                   }),
+                    retained_cadences.end());
+                retained_cadences.push_back(cadence);
+            }
+            state.movement_cadences = std::move(retained_cadences);
         }
         state.movements.erase(
             std::remove_if(
@@ -743,7 +834,7 @@ class visual_animation_managerst {
                     const int32_t target =
                         movement.target.x * input.dimensions.y + movement.target.y;
                     const int32_t current = input.current[layer][target];
-                    return frame_time_ms - movement.start_time_ms >= movement_duration_ms ||
+                    return frame_time_ms - movement.start_time_ms >= movement.duration_ms ||
                            current == 0 ||
                            !visual_layer_matches(movement.layer, current, movement.texpos);
                 }),
@@ -829,7 +920,8 @@ class visual_animation_managerst {
             for (const movementst &movement : state.movements) {
                 if (movement.layer == layer && movement.target.x == target_x &&
                     movement.target.y == target_y) {
-                    return {true, movement.source, movement_progress(movement.start_time_ms)};
+                    return {true, movement.source,
+                            movement_progress(movement.start_time_ms, movement.duration_ms)};
                 }
                 if (layer == viewport_visual_layer::vehicle ||
                     layer == viewport_visual_layer::center ||
@@ -852,7 +944,7 @@ class visual_animation_managerst {
                 return {true,
                         {target_x + companion->source.x - companion->target.x,
                          target_y + companion->source.y - companion->target.y},
-                        movement_progress(companion->start_time_ms),
+                        movement_progress(companion->start_time_ms, companion->duration_ms),
                         true};
             break;
         }
