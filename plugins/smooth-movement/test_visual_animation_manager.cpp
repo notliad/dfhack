@@ -693,6 +693,45 @@ int main() {
     followed = same_frame.get_movement(viewport, viewport_visual_layer::center, 0, 1);
     assert(followed.active && followed.source.x == -1);
 
+    // A camera-followed visual can remain on the same screen tile while the
+    // terrain moves. Background buffers prove the scroll, and the rebased visual
+    // becomes the movement whose remaining displacement is cancelled by the camera.
+    visual_animation_managerst camera_follow;
+    small_grid follow_current;
+    small_grid follow_previous;
+    small_grid follow_background_current;
+    small_grid follow_background_previous;
+    constexpr int32_t initial_background = 9;
+    constexpr int32_t first_shifted_background = initial_background + 1;
+    constexpr int32_t second_shifted_background = initial_background + 2;
+    constexpr uint32_t follow_initial_frame_ms = 9000;
+    constexpr uint32_t follow_announce_frame_ms = follow_initial_frame_ms + 10;
+    constexpr uint32_t follow_landing_frame_ms = follow_announce_frame_ms + 10;
+    constexpr uint32_t follow_halfway_frame_ms = follow_landing_frame_ms + 50;
+    auto follow_input = make_input(viewport, pan_empty);
+    set_layer(follow_input, viewport_visual_layer::center, follow_current, follow_previous);
+    follow_input.current_background = follow_background_current.tiles;
+    follow_input.previous_background = follow_background_previous.tiles;
+    follow_current.at(1, 1) = creature_texpos;
+    follow_previous.at(1, 1) = creature_texpos;
+    follow_background_current.at(0, 0) = first_shifted_background;
+    follow_background_current.at(1, 0) = second_shifted_background;
+    follow_background_previous.at(0, 0) = initial_background;
+    follow_background_previous.at(1, 0) = first_shifted_background;
+    follow_background_previous.at(2, 0) = second_shifted_background;
+    run_frame(camera_follow, follow_input, follow_initial_frame_ms);
+    follow_input.pan = df::coord2d(1, 0);
+    follow_background_current = follow_background_previous;
+    run_frame(camera_follow, follow_input, follow_announce_frame_ms);
+    follow_background_current.at(0, 0) = first_shifted_background;
+    follow_background_current.at(1, 0) = second_shifted_background;
+    run_frame(camera_follow, follow_input, follow_landing_frame_ms);
+    auto follow = camera_follow.get_follow(viewport);
+    assert(follow.active && follow.offset.x == 1.0f && follow.offset.y == 0.0f);
+    run_frame(camera_follow, follow_input, follow_halfway_frame_ms);
+    follow = camera_follow.get_follow(viewport);
+    assert(follow.active && follow.offset.x == 0.5f && follow.offset.y == 0.0f);
+
     // A change that is NOT a pure pan (context revision bump) still resets, even
     // with in-flight work.
     visual_animation_managerst reset_on_zoom;

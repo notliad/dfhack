@@ -52,6 +52,9 @@ using tile_coveragest = std::set<df::coord2d>;
 decltype(&SDL_RenderCopyF) render_copy_f = nullptr;
 decltype(&SDL_RenderCopyExF) render_copy_ex_f = nullptr;
 decltype(&SDL_RenderFillRect) render_fill_rect = nullptr;
+decltype(&SDL_RenderSetClipRect) render_set_clip_rect = nullptr;
+decltype(&SDL_RenderIsClipEnabled) render_is_clip_enabled = nullptr;
+decltype(&SDL_RenderGetClipRect) render_get_clip_rect = nullptr;
 decltype(&SDL_GetRenderDrawColor) get_render_draw_color = nullptr;
 decltype(&SDL_SetRenderDrawColor) set_render_draw_color = nullptr;
 
@@ -178,6 +181,12 @@ template <typename Viewport> auto visual_layers(Viewport *vp, bool previous = fa
     return layers;
 }
 
+std::span<const int32_t> background_span(const int32_t *background, const df::coord2d dimensions) {
+    return background == nullptr ? std::span<const int32_t>{}
+                                 : std::span<const int32_t>(background,
+                                                            size_t(dimensions.x) * size_t(dimensions.y));
+}
+
 uint32_t fallback_movement_duration_ms() {
     const int32_t gfps_cap = init ? init->gfps_cap : default_game_fps;
     if (gfps_cap <= 0)
@@ -187,11 +196,14 @@ uint32_t fallback_movement_duration_ms() {
 
 viewport_visual_animation_inputst animation_input(df::graphic_viewportst *vp) {
     const df::graphic_viewportst *const_viewport = vp;
+    const df::coord2d dimensions(vp->dim_x, vp->dim_y);
     return {vp,
-            df::coord2d(vp->dim_x, vp->dim_y),
+            dimensions,
             visual_context_revision,
             visual_layers(const_viewport),
             visual_layers(const_viewport, true),
+            background_span(vp->screentexpos_background, dimensions),
+            background_span(vp->screentexpos_background_old, dimensions),
             fallback_movement_duration_ms(),
             df::coord2d(window_x ? *window_x : 0, window_y ? *window_y : 0)};
 }
@@ -786,6 +798,46 @@ void draw_viewport_interpolation_stages(df::renderer_2d_base *renderer,
     }
 }
 
+bool draw_followed_world(df::renderer_2d_base *renderer,
+                         const std::vector<viewport_renderst> &viewports,
+                         const tile_coveragest &coverage,
+                         const visual_follow_renderst &follow) {
+    df::graphic_viewportst *vp = gps ? gps->main_viewport : nullptr;
+    if (vp == nullptr)
+        return false;
+    const int32_t zoom = renderer->viewport_zoom_factor;
+    const int32_t tile = ::tile_size(zoom);
+    const df::coord2d offset_pixels(int32_t(std::lround(follow.offset.x * tile)),
+                                    int32_t(std::lround(follow.offset.y * tile)));
+    if (offset_pixels == df::coord2d{})
+        return false;
+
+    const df::coord2d saved_origin(renderer->origin_x, renderer->origin_y);
+    const SDL_Rect map_rect = {
+        tile_pixel(vp->clipx[0], saved_origin.x, zoom),
+        tile_pixel(vp->clipy[0], saved_origin.y, zoom),
+        tile_pixel(vp->clipx[1] + 1, saved_origin.x, zoom) -
+            tile_pixel(vp->clipx[0], saved_origin.x, zoom),
+        tile_pixel(vp->clipy[1] + 1, saved_origin.y, zoom) -
+            tile_pixel(vp->clipy[0], saved_origin.y, zoom)};
+    SDL_Renderer *sdl_renderer = static_cast<SDL_Renderer *>(renderer->sdl_renderer);
+    SDL_Rect saved_clip;
+    const bool had_clip = render_is_clip_enabled(sdl_renderer);
+    if (had_clip)
+        render_get_clip_rect(sdl_renderer, &saved_clip);
+    render_set_clip_rect(sdl_renderer, &map_rect);
+    renderer->origin_x = saved_origin.x + offset_pixels.x;
+    renderer->origin_y = saved_origin.y + offset_pixels.y;
+    for (int32_t x = vp->clipx[0]; x <= vp->clipx[1]; ++x)
+        for (int32_t y = vp->clipy[0]; y <= vp->clipy[1]; ++y)
+            redraw_world_tile(renderer, viewports, coverage, x, y);
+    draw_viewport_interpolation_stages(renderer, viewports, coverage);
+    renderer->origin_x = saved_origin.x;
+    renderer->origin_y = saved_origin.y;
+    render_set_clip_rect(sdl_renderer, had_clip ? &saved_clip : nullptr);
+    return true;
+}
+
 bool has_mirrored_viewport_facing(const std::vector<df::graphic_viewportst *> &viewports) {
     for (const df::graphic_viewportst *vp : viewports)
         if (animation_manager.has_mirrored_facing(vp))
@@ -807,14 +859,20 @@ void render_interpolated_world(df::renderer_2d_base *renderer) {
 
     if (!viewport_readable(vp) || renderer->sdl_renderer == nullptr)
         return;
+    const visual_follow_renderst follow = animation_manager.get_follow(vp);
     const bool animation_redraw =
         zlevel_enabled ? animation_manager.requires_full_redraw()
                        : animation_manager.has_active_movement(vp) || !previous_coverage.empty();
-    if (!animation_redraw && (!flip_enabled || !has_mirrored_viewport_facing(viewports)))
+    if (!follow.active && !animation_redraw &&
+        (!flip_enabled || !has_mirrored_viewport_facing(viewports)))
         return;
 
     std::vector<viewport_renderst> viewport_renders = collect_viewport_renders(renderer, viewports);
     tile_coveragest coverage = collect_viewport_coverage(viewport_renders);
+    if (follow.active && draw_followed_world(renderer, viewport_renders, coverage, follow)) {
+        previous_coverage.clear();
+        return;
+    }
 
     SDL_Renderer *sdl_renderer = static_cast<SDL_Renderer *>(renderer->sdl_renderer);
     const int32_t zoom = renderer->viewport_zoom_factor;
@@ -860,6 +918,9 @@ void clear_sdl_bindings() {
     render_copy_f = nullptr;
     render_copy_ex_f = nullptr;
     render_fill_rect = nullptr;
+    render_set_clip_rect = nullptr;
+    render_is_clip_enabled = nullptr;
+    render_get_clip_rect = nullptr;
     get_render_draw_color = nullptr;
     set_render_draw_color = nullptr;
 }
@@ -877,6 +938,9 @@ bool load_sdl(color_ostream &out) {
     bind(SDL_RenderCopyF, render_copy_f);
     bind(SDL_RenderCopyExF, render_copy_ex_f);
     bind(SDL_RenderFillRect, render_fill_rect);
+    bind(SDL_RenderSetClipRect, render_set_clip_rect);
+    bind(SDL_RenderIsClipEnabled, render_is_clip_enabled);
+    bind(SDL_RenderGetClipRect, render_get_clip_rect);
     bind(SDL_GetRenderDrawColor, get_render_draw_color);
     bind(SDL_SetRenderDrawColor, set_render_draw_color);
 #undef bind

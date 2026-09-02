@@ -6,8 +6,10 @@ smooth-movement
     :tags: fort interface
 
 This plugin makes creatures, hauled items, vehicles, and associated status
-icons glide between tiles. It only changes rendering; gameplay, simulation
-timing, and save data are unaffected.
+icons glide between tiles. When Dwarf Fortress follows a moving creature in
+Fortress or Adventure mode, the viewport also glides when the render buffers
+unambiguously identify that follow scroll. It only changes rendering; gameplay,
+simulation timing, and save data are unaffected.
 
 The plugin requires the SDL 2D renderer.
 

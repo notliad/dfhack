@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <span>
 #include <vector>
@@ -144,6 +145,8 @@ struct viewport_visual_animation_inputst {
     uint64_t context_revision = 0;
     std::array<const int32_t *, static_cast<size_t>(viewport_visual_layer::count)> current{};
     std::array<const int32_t *, static_cast<size_t>(viewport_visual_layer::count)> previous{};
+    std::span<const int32_t> current_background;
+    std::span<const int32_t> previous_background;
     uint32_t movement_duration_ms = default_movement_duration_ms;
     // Current map-scroll offset (window_x/window_y). A pure pan does not bump
     // context_revision. Only a hint: it changes at input time, the buffers shift
@@ -157,6 +160,12 @@ struct viewport_visual_animation_inputst {
             if (current[layer] == nullptr || previous[layer] == nullptr)
                 return false;
         }
+        if (current_background.empty() != previous_background.empty())
+            return false;
+        if (!current_background.empty() &&
+            (current_background.size() != size_t(dimensions.x) * size_t(dimensions.y) ||
+             previous_background.size() != current_background.size()))
+            return false;
         return true;
     }
 };
@@ -166,6 +175,11 @@ struct visual_movement_renderst {
     DFHack::Coord2d<float> source{0.0f, 0.0f};
     float progress = 1.0f;
     bool inherited = false;
+};
+
+struct visual_follow_renderst {
+    bool active = false;
+    DFHack::Coord2d<float> offset{0.0f, 0.0f};
 };
 
 inline float animation_progress(uint32_t now_ms, uint32_t start_time_ms, uint32_t duration_ms) {
@@ -206,6 +220,7 @@ constexpr int32_t mirrored_tile_x(int32_t piece_x, int32_t anchor_x) {
 
 class visual_animation_managerst {
     struct movementst {
+        uint64_t id;
         viewport_visual_layer layer;
         int32_t texpos;
         DFHack::Coord2d<float> source;
@@ -229,6 +244,7 @@ class visual_animation_managerst {
         bool seen = false;
         std::vector<movementst> movements;
         std::vector<movement_cadencest> movement_cadences;
+        uint64_t follow_movement_id = 0;
         uint32_t movement_duration_ms = default_movement_duration_ms;
         // One facing per tile, not per unit: the viewport exposes one creature
         // texpos per tile.
@@ -260,6 +276,7 @@ class visual_animation_managerst {
     uint32_t frame_delta_ms = 0;
     bool has_frame = false;
     bool force_full_redraw = false;
+    uint64_t next_movement_id = 1;
     std::vector<viewport_animationst> viewports;
 
     // Cadence is trusted for only a bounded multiple of the configured fallback.
@@ -272,6 +289,8 @@ class visual_animation_managerst {
     static constexpr int32_t max_pending_age_frames = 120;
     // A majority of visible, position-bearing sprites must confirm a scroll.
     static constexpr double min_scroll_match_ratio = 0.5;
+    // Terrain is denser evidence than sprites, so require a stronger match.
+    static constexpr double min_background_scroll_match_ratio = 0.6;
     // Wait for buffer settling before treating changes as creature movement.
     static constexpr int32_t scroll_settle_redraws = 2;
     // Give up when a queued scroll does not match this many redraws.
@@ -286,6 +305,7 @@ class visual_animation_managerst {
     static void abandon_pending(viewport_animationst &state) {
         state.movements.clear();
         state.movement_cadences.clear();
+        state.follow_movement_id = 0;
         clear_pending(state);
     }
 
@@ -316,7 +336,37 @@ class visual_animation_managerst {
                 hash = (hash ^ uint64_t(uint32_t(input.previous[layer][i]))) * fnv_prime;
             }
         }
+        if (!input.current_background.empty() && !input.previous_background.empty())
+            for (int32_t i = 0; i < tile_count; ++i) {
+                hash = (hash ^ uint64_t(uint32_t(input.current_background[i]))) * fnv_prime;
+                hash = (hash ^ uint64_t(uint32_t(input.previous_background[i]))) * fnv_prime;
+            }
         return hash;
+    }
+
+    static double background_shift_match_ratio(const viewport_visual_animation_inputst &input,
+                                               int32_t dwx, int32_t dwy) {
+        if (input.current_background.empty() || input.previous_background.empty())
+            return -1.0;
+        int32_t considered = 0;
+        int32_t matches = 0;
+        for (int32_t x = 0; x < input.dimensions.x; ++x) {
+            const int32_t sx = x + dwx;
+            if (sx < 0 || sx >= input.dimensions.x)
+                continue;
+            for (int32_t y = 0; y < input.dimensions.y; ++y) {
+                const int32_t sy = y + dwy;
+                if (sy < 0 || sy >= input.dimensions.y)
+                    continue;
+                const int32_t current = input.current_background[x * input.dimensions.y + y];
+                if (current == 0)
+                    continue;
+                ++considered;
+                if (input.previous_background[sx * input.dimensions.y + sy] == current)
+                    ++matches;
+            }
+        }
+        return considered == 0 ? -1.0 : double(matches) / double(considered);
     }
 
     // Fraction of tracked sprites consistent with a buffer shift:
@@ -526,13 +576,17 @@ class visual_animation_managerst {
                 // apply.
                 if (shift == df::coord2d{0, 0})
                     continue;
-                const double ratio = shift_match_ratio(input, shift.x, shift.y);
+                const double background_ratio = background_shift_match_ratio(input, shift.x, shift.y);
+                const double ratio = background_ratio >= 0.0
+                                         ? background_ratio
+                                         : shift_match_ratio(input, shift.x, shift.y);
                 // Emptiness is per-prefix: a long one can push every sprite out of
                 // range while a shorter one still has something to say.
                 if (ratio < 0.0)
                     continue;
                 any_data = true;
-                if (ratio >= min_scroll_match_ratio) {
+                if (ratio >= (background_ratio >= 0.0 ? min_background_scroll_match_ratio
+                                                      : min_scroll_match_ratio)) {
                     landed = shift;
                     landed_count = count;
                     break;
@@ -597,17 +651,23 @@ class visual_animation_managerst {
                 state.suppress_frames = 0;
                 landed_shift = landed;
                 translated = true;
-            } else if (shift_match_ratio(input, 0, 0) >= min_scroll_match_ratio &&
-                       ++state.pending_age <= max_pending_age_frames) {
+            } else {
+                const double static_background_ratio = background_shift_match_ratio(input, 0, 0);
+                const bool buffers_static =
+                    static_background_ratio >= 0.0
+                        ? static_background_ratio >= min_background_scroll_match_ratio
+                        : shift_match_ratio(input, 0, 0) >= min_scroll_match_ratio;
+                if (buffers_static && ++state.pending_age <= max_pending_age_frames) {
                 // The buffers have not moved yet, so the scroll is still in flight.
                 state.pending_frames = 0;
-            } else if (++state.pending_frames > max_unmatched_scroll_redraws) {
+                } else if (++state.pending_frames > max_unmatched_scroll_redraws) {
                 // The shift never showed up recognizably: fall back to the safe reset.
                 abandon_pending(state);
                 // The delta was never identified, so the grid cannot be translated.
                 reset_facing(state);
                 // It may yet land, so do not resume detection on the very next redraw.
                 state.suppress_frames = scroll_settle_redraws;
+                }
             }
         }
 
@@ -653,6 +713,9 @@ class visual_animation_managerst {
                 state.movement_cadences;
             std::vector<uint8_t> claimed_cadences(cadences_at_frame_start.size());
             std::vector<movement_cadencest> new_cadences;
+            long double best_follow_distance = std::numeric_limits<long double>::max();
+            if (translated)
+                state.follow_movement_id = 0;
             // A chained movement's source may already have been rewritten this frame.
             const std::vector<int8_t> facing_at_frame_start = state.facing;
             // Source clears are deferred until every movement this frame is
@@ -768,12 +831,28 @@ class visual_animation_managerst {
                                 {float(movement.target.x), float(movement.target.y)}, progress);
                             break;
                         }
-                        state.movements.push_back({static_cast<viewport_visual_layer>(layer),
+                        const uint64_t movement_id = next_movement_id++;
+                        state.movements.push_back({movement_id,
+                                                   static_cast<viewport_visual_layer>(layer),
                                                    texpos,
                                                    visual_source,
                                                    df::coord2d(x, y),
                                                    frame_time_ms,
                                                    duration_ms});
+                        if (translated &&
+                            static_cast<viewport_visual_layer>(layer) ==
+                                viewport_visual_layer::center &&
+                            df::coord2d(x - source_tile.x, y - source_tile.y) == landed_shift) {
+                            const long double centered_x =
+                                static_cast<long double>(2) * x - (input.dimensions.x - 1);
+                            const long double centered_y =
+                                static_cast<long double>(2) * y - (input.dimensions.y - 1);
+                            const long double distance = centered_x * centered_x + centered_y * centered_y;
+                            if (distance < best_follow_distance) {
+                                best_follow_distance = distance;
+                                state.follow_movement_id = movement_id;
+                            }
+                        }
                         if (static_cast<viewport_visual_layer>(layer) ==
                                 viewport_visual_layer::center &&
                             state.facing.size() ==
@@ -908,6 +987,23 @@ class visual_animation_managerst {
                 return !state.movements.empty();
         }
         return false;
+    }
+
+    visual_follow_renderst get_follow(const void *viewport) const {
+        for (const viewport_animationst &state : viewports) {
+            if (state.viewport != viewport || state.follow_movement_id == 0)
+                continue;
+            for (const movementst &movement : state.movements) {
+                if (movement.id != state.follow_movement_id)
+                    continue;
+                const float remaining =
+                    1.0f - movement_progress(movement.start_time_ms, movement.duration_ms);
+                return {true,
+                        {(float(movement.target.x) - movement.source.x) * remaining,
+                         (float(movement.target.y) - movement.source.y) * remaining}};
+            }
+        }
+        return {};
     }
 
     visual_movement_renderst get_movement(const void *viewport, viewport_visual_layer layer,
